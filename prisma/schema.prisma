@@ -1,0 +1,331 @@
+// Hospitality, travel & events booking marketplace: providers (hotels, rentals,
+// tour operators, escape rooms, event venues, restaurants) list bookable
+// options and the resources that fulfil them (rooms, units, tables, spaces or
+// staff); customers book; an admin oversees the platform.
+// Connection settings live in prisma.config.ts.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  CUSTOMER
+  PROVIDER
+  EMPLOYEE
+  ADMIN
+}
+
+enum BusinessCategory {
+  HOTEL
+  SHORT_TERM_RENTAL
+  TOUR_OPERATOR
+  ESCAPE_ROOM
+  EVENT_VENUE
+  RESTAURANT
+}
+
+/// TIMED: a start time and fixed length (tours, escape rooms, tables, venues).
+/// NIGHTLY: check-in and check-out dates (hotel rooms, rental units).
+enum BookingType {
+  TIMED
+  NIGHTLY
+}
+
+enum PricingUnit {
+  PER_BOOKING
+  PER_PERSON
+  PER_NIGHT
+}
+
+/// What a resource is. STAFF resources are people with a login (e.g. tour guides).
+enum ResourceKind {
+  STAFF
+  ROOM
+  UNIT
+  TABLE
+  SPACE
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum PaymentStatus {
+  UNPAID
+  PARTIAL
+  PAID
+  REFUNDED
+}
+
+/// What the guest chose to pay before the booking is confirmed
+enum PaymentPlan {
+  DEPOSIT
+  FULL
+}
+
+enum PaymentMethod {
+  CASH
+  GCASH
+  CARD
+  BANK
+}
+
+model User {
+  id                 String         @id @default(cuid())
+  name               String
+  email              String         @unique
+  passwordHash       String
+  phone              String?
+  /// Small profile photo stored as a data: URL (resized in the browser)
+  avatarUrl          String?
+  role               Role           @default(CUSTOMER)
+  /// Preference: also send notifications by email
+  emailNotifications Boolean        @default(true)
+  /// Suspended accounts can't sign in
+  isActive           Boolean        @default(true)
+  /// Set once the person proves they own the email address (code sent at sign-up)
+  emailVerifiedAt    DateTime?
+  /// Hash of the current verification code and when it stops working
+  emailCodeHash      String?
+  emailCodeExpiresAt DateTime?
+  createdAt          DateTime       @default(now())
+
+  provider      Provider?      @relation("ProviderOwner")
+  /// Set when this user is a staff resource (e.g. a tour guide)
+  resource      Resource?
+  bookings      Booking[]      @relation("CustomerBookings")
+  reviews       Review[]
+  notifications Notification[]
+}
+
+model Provider {
+  id           String           @id @default(cuid())
+  owner        User             @relation("ProviderOwner", fields: [ownerId], references: [id])
+  ownerId      String           @unique
+  businessName String
+  category     BusinessCategory
+  address      String?
+  description  String?
+  /// How guests pay the deposit: GCash number, bank account, etc. Shown at checkout.
+  paymentInstructions String?
+  /// Listings stay hidden until an admin approves the business
+  isApproved   Boolean          @default(false)
+  createdAt    DateTime         @default(now())
+
+  /// Remembered for the next cash-out
+  payoutGcashName   String?
+  payoutGcashNumber String?
+
+  services  Service[]
+  resources Resource[]
+  bookings  Booking[]
+  payouts   Payout[]
+}
+
+/// Something that can only be booked once at a time: a room, rental unit,
+/// table, space, or a staff member. Bookings are auto-assigned to a free one.
+model Resource {
+  id         String       @id @default(cuid())
+  provider   Provider     @relation(fields: [providerId], references: [id])
+  providerId String
+  kind       ResourceKind @default(STAFF)
+  /// Name of a room, unit, table or space ("Room 1201", "Table 4"); staff show their own name
+  name       String?
+  user       User?        @relation(fields: [userId], references: [id])
+  userId     String?      @unique
+  /// Inactive resources keep their history but get no new bookings
+  isActive   Boolean      @default(true)
+  createdAt  DateTime     @default(now())
+
+  /// Options this resource can fulfil
+  services  Service[]
+  schedules WorkSchedule[]
+  bookings  Booking[]
+
+  @@index([providerId])
+}
+
+/// A bookable option, e.g. "Deluxe King Room", "Island Hopping Tour A", "Table for 4".
+model Service {
+  id           String      @id @default(cuid())
+  provider     Provider    @relation(fields: [providerId], references: [id])
+  providerId   String
+  name         String
+  description  String?
+  bookingType  BookingType @default(TIMED)
+  pricingUnit  PricingUnit @default(PER_BOOKING)
+  price        Decimal     @db.Decimal(10, 2)
+  /// Length of a timed booking in minutes (not used for nightly stays)
+  durationMin  Int?
+  /// Largest party one booking can hold
+  maxGuests    Int         @default(1)
+  /// Nightly stays: wall-clock check-in / check-out times, e.g. "14:00" / "12:00"
+  checkInTime  String?
+  checkOutTime String?
+  isActive     Boolean     @default(true)
+  createdAt    DateTime    @default(now())
+
+  resources Resource[]
+  bookings  Booking[]
+
+  @@index([providerId])
+}
+
+/// Weekly opening hours of a resource, used for timed bookings. Several rows
+/// per day allow split shifts (e.g. lunch and dinner service).
+model WorkSchedule {
+  id         String   @id @default(cuid())
+  resource   Resource @relation(fields: [resourceId], references: [id], onDelete: Cascade)
+  resourceId String
+  /// 0 = Sunday ... 6 = Saturday
+  dayOfWeek  Int
+  /// "09:00", wall-clock time in the platform time zone
+  startTime  String
+  /// "17:00"
+  endTime    String
+
+  @@index([resourceId, dayOfWeek])
+}
+
+model Booking {
+  id             String        @id @default(cuid())
+  customer       User          @relation("CustomerBookings", fields: [customerId], references: [id])
+  customerId     String
+  provider       Provider      @relation(fields: [providerId], references: [id])
+  providerId     String
+  service        Service       @relation(fields: [serviceId], references: [id])
+  serviceId      String
+  resource       Resource?     @relation(fields: [resourceId], references: [id])
+  resourceId     String?
+  /// Start time, or check-in for nightly stays
+  startAt        DateTime
+  /// End time, or check-out for nightly stays
+  endAt          DateTime
+  /// Party size
+  guests         Int           @default(1)
+  status         BookingStatus @default(PENDING)
+  /// The total the customer agreed to, kept even if the price changes later
+  priceAtBooking Decimal       @db.Decimal(10, 2)
+  notes          String?
+  cancelledAt    DateTime?
+  /// Set by the daily reminder job so nobody is reminded twice
+  reminderSentAt DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  payment Payment?
+  review  Review?
+
+  // An exclusion constraint (see migrations) also guarantees at the database
+  // level that one resource's PENDING/CONFIRMED bookings never overlap.
+  @@index([resourceId, startAt])
+  @@index([providerId, startAt])
+  @@index([customerId, startAt])
+  @@index([startAt])
+}
+
+/// Payment tracking only (recording, not processing).
+/// Platform-wide settings (one row, id "default"): where guests send GCash
+/// payments and the commission the platform keeps.
+model PlatformSettings {
+  id                String   @id @default("default")
+  gcashName         String   @default("Booking System Payments")
+  gcashNumber       String   @default("0917 123 4567")
+  /// QR image as a data: URL (uploaded by the admin)
+  gcashQrUrl        String?
+  /// Percent of each confirmed payment kept by the platform
+  commissionPercent Decimal  @default(5) @db.Decimal(5, 2)
+  updatedAt         DateTime @updatedAt
+}
+
+enum PayoutStatus {
+  REQUESTED
+  PAID
+  REJECTED
+}
+
+/// A business cashing out its earnings (net of commission) to its GCash.
+model Payout {
+  id          String       @id @default(cuid())
+  provider    Provider     @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  providerId  String
+  amount      Decimal      @db.Decimal(10, 2)
+  gcashName   String
+  gcashNumber String
+  status      PayoutStatus @default(REQUESTED)
+  /// GCash reference of the transfer, filled in by the admin when paid
+  reference   String?
+  /// Admin note, e.g. why a request was rejected
+  note        String?
+  requestedAt DateTime     @default(now())
+  resolvedAt  DateTime?
+
+  @@index([providerId, status])
+}
+
+model Payment {
+  id         String        @id @default(cuid())
+  booking    Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  bookingId  String        @unique
+  /// Deposit or full payment, chosen by the guest at checkout
+  plan       PaymentPlan   @default(FULL)
+  /// What the guest owes upfront under that plan
+  amountDue  Decimal       @default(0) @db.Decimal(10, 2)
+  /// When the guest reported sending the payment (confirmed by the business later)
+  claimedAt  DateTime?
+  /// Confirmed by the business
+  amountPaid Decimal       @db.Decimal(10, 2)
+  /// Platform commission on amountPaid, fixed when the payment was confirmed
+  commissionPercent Decimal @default(0) @db.Decimal(5, 2)
+  commissionAmount  Decimal @default(0) @db.Decimal(10, 2)
+  method     PaymentMethod
+  status     PaymentStatus @default(UNPAID)
+  /// GCash reference no., receipt no., etc.
+  reference  String?
+  paidAt     DateTime?
+  updatedAt  DateTime      @updatedAt
+}
+
+model Review {
+  id         String   @id @default(cuid())
+  booking    Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  bookingId  String   @unique
+  customer   User     @relation(fields: [customerId], references: [id])
+  customerId String
+  /// 1-5, enforced by a CHECK constraint
+  rating     Int
+  comment    String?
+  /// Hidden by an admin (moderation); excluded from ratings
+  isHidden   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  title     String
+  message   String
+  /// Page to open when the notification is clicked
+  link      String?
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+/// Fixed-window counters for rate limiting (login, sign-up, booking).
+model RateLimit {
+  key     String   @id
+  count   Int
+  resetAt DateTime
+}
